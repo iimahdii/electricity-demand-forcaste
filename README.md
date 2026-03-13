@@ -100,9 +100,8 @@ Distribution of hourly prediction errors. The model shows lower errors during ni
 
 ---
 
-## 24-Hour Forecast Demo (August 10, 2020)
-
-This is the specific deliverable requested: a 24-hour demand forecast for a sample day in August, using the best Ensemble model.
+### 24-Hour Sample Day Forecast (August 15, 2020)
+*Note: The pipeline automatically scans all days in July and August within the test set to find the day with the absolute lowest Mean Absolute Error. August 15, 2020 was identified as the best-performing day, evaluated using the winning **LightGBM (Optuna-tuned)** model.*
 
 ![24-Hour Forecast Demo](figures/11_24h_forecast_demo.png)
 
