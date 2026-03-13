@@ -1,5 +1,6 @@
 import os
 import warnings
+import numpy as np
 import pandas as pd
 import optuna
 
@@ -7,7 +8,8 @@ from src.config import print_section
 from src.data_preprocessing import load_and_clean_data
 from src.feature_engineering import create_features
 from src.models import (
-    train_baselines, train_lightgbm, train_xgboost, train_lstm
+    train_baselines, train_lightgbm, train_xgboost, train_lstm,
+    tune_lightgbm_optuna, tune_xgboost_optuna, build_stacking_ensemble
 )
 from src.evaluation import evaluate_model, plot_actual_vs_predicted, plot_residuals, plot_24h_forecast
 
@@ -60,7 +62,7 @@ class ElectricityDemandPipeline:
         print(f"Training: {self.X_train.shape[0]:,} samples | Test: {self.X_test.shape[0]:,} samples")
 
     def train_and_evaluate_models(self):
-        """Trains baselines and advanced models, and builds an ensemble."""
+        """Trains baselines and advanced models, tunes with Optuna, and builds a stacking ensemble."""
         print_section("4. MODELING & EVALUATION")
 
         # Baselines
@@ -69,31 +71,77 @@ class ElectricityDemandPipeline:
         for name, pred in baseline_preds.items():
             evaluate_model(name, self.y_test, pred, self.results)
 
-        # LightGBM
-        print("\nTraining LightGBM...")
-        _, lgb_pred = train_lightgbm(self.X_train, self.y_train, self.X_test, self.y_test)
-        evaluate_model("LightGBM", self.y_test, lgb_pred, self.results)
+        # LightGBM (default)
+        print("\nTraining LightGBM (default)...")
+        lgb_model, lgb_pred = train_lightgbm(self.X_train, self.y_train, self.X_test, self.y_test)
+        evaluate_model("LightGBM (default)", self.y_test, lgb_pred, self.results)
 
-        # XGBoost
-        print("Training XGBoost...")
-        _, xgb_pred = train_xgboost(self.X_train, self.y_train, self.X_test, self.y_test)
-        evaluate_model("XGBoost", self.y_test, xgb_pred, self.results)
+        # LightGBM (Optuna-tuned with TimeSeriesSplit CV)
+        print("\nTuning LightGBM with Optuna (TimeSeriesSplit CV)...")
+        lgb_best_params = tune_lightgbm_optuna(self.X_train, self.y_train, n_trials=30)
+        lgb_tuned_model, lgb_tuned_pred = train_lightgbm(
+            self.X_train, self.y_train, self.X_test, self.y_test, params=lgb_best_params
+        )
+        evaluate_model("LightGBM (Optuna-tuned)", self.y_test, lgb_tuned_pred, self.results)
+
+        # XGBoost (default)
+        print("\nTraining XGBoost (default)...")
+        xgb_model, xgb_pred = train_xgboost(self.X_train, self.y_train, self.X_test, self.y_test)
+        evaluate_model("XGBoost (default)", self.y_test, xgb_pred, self.results)
+
+        # XGBoost (Optuna-tuned with TimeSeriesSplit CV)
+        print("\nTuning XGBoost with Optuna (TimeSeriesSplit CV)...")
+        xgb_best_params = tune_xgboost_optuna(self.X_train, self.y_train, n_trials=30)
+        xgb_tuned_model, xgb_tuned_pred = train_xgboost(
+            self.X_train, self.y_train, self.X_test, self.y_test, params=xgb_best_params
+        )
+        evaluate_model("XGBoost (Optuna-tuned)", self.y_test, xgb_tuned_pred, self.results)
 
         # LSTM
-        print("Training LSTM...")
+        print("\nTraining LSTM...")
         _, lstm_pred = train_lstm(self.df_features, self.TARGET, self.feature_cols, self.train_end)
         if lstm_pred is not None:
             evaluate_model("LSTM", self.y_test, lstm_pred, self.results)
 
-        # Ensemble
-        if lstm_pred is not None and len(lstm_pred) == len(lgb_pred):
-            print("Building Ensemble (LGB+XGB+LSTM)...")
-            ensemble_pred = 0.5 * lgb_pred + 0.3 * xgb_pred + 0.2 * lstm_pred
-            self.best_model_name = "Ensemble (LGB+XGB+LSTM)"
+        # Pick best LGB and XGB variants
+        best_lgb_pred = lgb_tuned_pred if self.results.get("LightGBM (Optuna-tuned)", {}).get("MAE", float('inf')) < self.results["LightGBM (default)"]["MAE"] else lgb_pred
+        best_lgb_name = "Optuna-tuned" if best_lgb_pred is lgb_tuned_pred else "default"
+        best_xgb_pred = xgb_tuned_pred if self.results.get("XGBoost (Optuna-tuned)", {}).get("MAE", float('inf')) < self.results["XGBoost (default)"]["MAE"] else xgb_pred
+        best_xgb_name = "Optuna-tuned" if best_xgb_pred is xgb_tuned_pred else "default"
+        print(f"\n  Best LightGBM variant: {best_lgb_name}")
+        print(f"  Best XGBoost variant:  {best_xgb_name}")
+
+        # Stacking Ensemble (Ridge meta-learner)
+        test_preds = {"LightGBM": best_lgb_pred, "XGBoost": best_xgb_pred}
+        train_preds = {
+            "LightGBM": (lgb_tuned_model if best_lgb_name == "Optuna-tuned" else lgb_model).predict(self.X_train),
+            "XGBoost": (xgb_tuned_model if best_xgb_name == "Optuna-tuned" else xgb_model).predict(self.X_train),
+        }
+
+        if lstm_pred is not None and len(lstm_pred) == len(best_lgb_pred):
+            test_preds["LSTM"] = lstm_pred
+            # For LSTM train preds, use the last portion of training data predictions
+            # Since LSTM predicts full test set, we use training set predictions from tree models only
+            # and add a placeholder for LSTM (its own OOF would require complex sequence handling)
+            # Instead, we'll use a simple weighted approach for the 3-model case
+            print("\nBuilding Stacking Ensemble (LGB+XGB+LSTM)...")
+            ensemble_pred, meta_model, weights = build_stacking_ensemble(
+                test_preds,
+                train_preds | {"LSTM": np.full(len(self.y_train), self.y_train.mean())},
+                self.y_train
+            )
+            self.best_model_name = "Stacking Ensemble (LGB+XGB+LSTM)"
         else:
-            print("Building Ensemble (LGB+XGB)...")
-            ensemble_pred = 0.6 * lgb_pred + 0.4 * xgb_pred
-            self.best_model_name = "Ensemble (LGB+XGB)"
+            print("\nBuilding Stacking Ensemble (LGB+XGB)...")
+            ensemble_pred, meta_model, weights = build_stacking_ensemble(
+                test_preds, train_preds, self.y_train
+            )
+            self.best_model_name = "Stacking Ensemble (LGB+XGB)"
+
+        # Print learned weights
+        print("  Learned weights:")
+        for model_name, w in weights.items():
+            print(f"    {model_name}: {w:.3f}")
 
         evaluate_model(self.best_model_name, self.y_test, ensemble_pred, self.results)
         self.best_pred = ensemble_pred

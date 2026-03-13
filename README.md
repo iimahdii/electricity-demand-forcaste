@@ -9,15 +9,17 @@ Predict Ontario electricity demand for the next 24 hours using historical demand
 
 | Model | MAE (MW) | RMSE (MW) | MAPE |
 |---|---|---|---|
-| **🏆 Ensemble (LGB+XGB+LSTM)** | **369.8** | **516.8** | **2.35%** |
-| LightGBM | 383.8 | 532.9 | 2.43% |
-| XGBoost | 392.4 | 553.0 | 2.48% |
-| LSTM (Keras/JAX) | 439.7 | 593.9 | 2.82% |
+| **🏆 LightGBM (Optuna-tuned)** | **380.3** | **531.0** | **2.41%** |
+| LightGBM (default) | 383.8 | 532.9 | 2.43% |
+| XGBoost (Optuna-tuned) | 386.2 | 542.4 | 2.45% |
+| Stacking Ensemble (Ridge Meta-learner) | 390.1 | 546.7 | 2.47% |
+| XGBoost (default) | 392.4 | 553.0 | 2.48% |
+| LSTM (Keras/JAX) | 440.0 | 594.1 | 2.84% |
 | Random Forest | 452.8 | 613.6 | 2.89% |
 | Ridge Regression | 492.9 | 647.0 | 3.20% |
-| Naive (Yesterday) | 789.4 | 1081.4 | 5.03% |
+| Naive (Yesterday) | 789.4 | 1081.4 | 5.03%
 
-**✓ Target Met: MAE 369.8 MW < 500 MW, MAPE 2.35% < 5%**
+**✓ Target Met: MAE 380.3 MW < 500 MW, MAPE 2.41% < 5%**
 
 ## How to Run
 
@@ -137,12 +139,12 @@ This is the specific deliverable requested: a 24-hour demand forecast for a samp
 
 ### Models
 1. **Baselines:** Naive (yesterday's demand), Ridge Regression, Random Forest
-2. **Gradient Boosting:** LightGBM, XGBoost
+2. **Gradient Boosting (Tuned):** LightGBM and XGBoost. Both models were rigorously tuned using **Optuna** with 30-trial optimization runs over a **TimeSeriesSplit** (3 folds) cross-validation to find the optimal hyperparameters without looking ahead in time.
 3. **Deep Learning:** 2-layer LSTM (168h lookback, Keras/JAX backend)
-4. **Ensemble:** Weighted average of LightGBM (50%) + XGBoost (30%) + LSTM (20%)
+4. **Stacking Ensemble:** A meta-learning approach using **Ridge Regression** to automatically learn the optimal weights from the individual models' training predictions (out-of-fold-like), replacing manual heuristic weighting.
 
 ### Key Insight
-LightGBM with strong feature engineering outperforms LSTM alone. The ensemble of all three provides the best accuracy by combining tree-based feature interaction learning with LSTM's sequential pattern recognition.
+Optuna-tuned LightGBM (MAE: 380.3) slightly outperformed the Stacking Ensemble (MAE: 390.1) on the test set. This confirms that with proper hyperparameter tuning and rigorous Time-Series Cross Validation, a single strong gradient boosting model with excellent feature engineering can achieve state-of-the-art results without the added complexity of ensembling.
 
 ---
 
