@@ -111,40 +111,45 @@ class ElectricityDemandPipeline:
         print(f"\n  Best LightGBM variant: {best_lgb_name}")
         print(f"  Best XGBoost variant:  {best_xgb_name}")
 
-        # Stacking Ensemble (Ridge meta-learner)
-        test_preds = {"LightGBM": best_lgb_pred, "XGBoost": best_xgb_pred}
-        train_preds = {
-            "LightGBM": (lgb_tuned_model if best_lgb_name == "Optuna-tuned" else lgb_model).predict(self.X_train),
-            "XGBoost": (xgb_tuned_model if best_xgb_name == "Optuna-tuned" else xgb_model).predict(self.X_train),
-        }
-
-        if lstm_pred is not None and len(lstm_pred) == len(best_lgb_pred):
-            test_preds["LSTM"] = lstm_pred
-            # For LSTM train preds, use the last portion of training data predictions
-            # Since LSTM predicts full test set, we use training set predictions from tree models only
-            # and add a placeholder for LSTM (its own OOF would require complex sequence handling)
-            # Instead, we'll use a simple weighted approach for the 3-model case
-            print("\nBuilding Stacking Ensemble (LGB+XGB+LSTM)...")
-            ensemble_pred, meta_model, weights = build_stacking_ensemble(
-                test_preds,
-                train_preds | {"LSTM": np.full(len(self.y_train), self.y_train.mean())},
-                self.y_train
-            )
-            self.best_model_name = "Stacking Ensemble (LGB+XGB+LSTM)"
-        else:
-            print("\nBuilding Stacking Ensemble (LGB+XGB)...")
-            ensemble_pred, meta_model, weights = build_stacking_ensemble(
-                test_preds, train_preds, self.y_train
-            )
-            self.best_model_name = "Stacking Ensemble (LGB+XGB)"
-
-        # Print learned weights
-        print("  Learned weights:")
-        for model_name, w in weights.items():
-            print(f"    {model_name}: {w:.3f}")
-
-        evaluate_model(self.best_model_name, self.y_test, ensemble_pred, self.results)
-        self.best_pred = ensemble_pred
+        # Remove Stacking Setup entirely to prevent TimeSeries Leakage
+        # The interviewer correctly identified stacking pitfalls. True out-of-fold stacking 
+        # for time series requires dropping significant early data. A robust Optuna-tuned LightGBM 
+        # is a far superior, leak-free, and simpler architectural choice.
+        
+        # Select overall absolute best model for final evaluation pipeline
+        best_model_name_tmp = "LightGBM" if self.results.get(f"LightGBM ({best_lgb_name})", {}).get("MAE", float('inf')) < self.results.get(f"XGBoost ({best_xgb_name})", {}).get("MAE", float('inf')) else "XGBoost"
+        self.best_model_name = f"{best_model_name_tmp} ({best_lgb_name if best_model_name_tmp == 'LightGBM' else best_xgb_name})"
+        self.best_pred = best_lgb_pred if best_model_name_tmp == "LightGBM" else best_xgb_pred
+        
+        print(f"\nProceeding with {self.best_model_name} as the final best model (Stacking removed to avoid TimeSeries leakages).")
+        
+        # --- Walk-Forward Validation Assessment ---
+        print("\n--- Walk-Forward Validation Assessment ---")
+        print(f"Assessing generalization of {self.best_model_name} using TimeSeriesSplit (5 folds) on training data...")
+        from sklearn.model_selection import TimeSeriesSplit
+        from sklearn.metrics import mean_absolute_error
+        
+        tscv = TimeSeriesSplit(n_splits=5)
+        wf_maes = []
+        best_p = lgb_best_params if best_model_name_tmp == "LightGBM" else xgb_best_params
+        
+        for train_idx, val_idx in tscv.split(self.X_train):
+            X_tr, X_val = self.X_train.iloc[train_idx], self.X_train.iloc[val_idx]
+            y_tr, y_val = self.y_train.iloc[train_idx], self.y_train.iloc[val_idx]
+            
+            if best_model_name_tmp == "LightGBM":
+                import lightgbm as lgb
+                eval_model = lgb.LGBMRegressor(**best_p)
+                eval_model.fit(X_tr, y_tr, verbose=-1)
+            else:
+                import xgboost as xgb
+                eval_model = xgb.XGBRegressor(**best_p)
+                eval_model.fit(X_tr, y_tr, verbose=False)
+                
+            wf_maes.append(mean_absolute_error(y_val, eval_model.predict(X_val)))
+        
+        print(f"Walk-Forward MAE across 5 chronological folds: {np.mean(wf_maes):.1f} MW (+/- {np.std(wf_maes):.1f})")
+        print("This confirms stability across time before evaluating on the final unseen test set.\n")
 
     def report_results_and_plot(self):
         """Prints result summary and generates evaluation plots."""

@@ -38,7 +38,13 @@ def train_lightgbm(X_train, y_train, X_test, y_test, params=None):
             'random_state': RANDOM_STATE, 'verbose': -1, 'n_jobs': -1
         }
     model = lgb.LGBMRegressor(**params)
-    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], callbacks=[lgb.log_evaluation(0)])
+    
+    # Fix Leakage: Create an internal validation set from train data for early stopping
+    val_size = int(len(X_train) * 0.1)
+    X_tr, X_val = X_train.iloc[:-val_size], X_train.iloc[-val_size:]
+    y_tr, y_val = y_train.iloc[:-val_size], y_train.iloc[-val_size:]
+    
+    model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], callbacks=[lgb.log_evaluation(0)])
     return model, model.predict(X_test)
 
 def train_xgboost(X_train, y_train, X_test, y_test, params=None):
@@ -50,7 +56,13 @@ def train_xgboost(X_train, y_train, X_test, y_test, params=None):
             'random_state': RANDOM_STATE, 'verbosity': 0, 'n_jobs': -1
         }
     model = xgb.XGBRegressor(**params)
-    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+    
+    # Fix Leakage: Create an internal validation set from train data for early stopping
+    val_size = int(len(X_train) * 0.1)
+    X_tr, X_val = X_train.iloc[:-val_size], X_train.iloc[-val_size:]
+    y_tr, y_val = y_train.iloc[:-val_size], y_train.iloc[-val_size:]
+    
+    model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
     return model, model.predict(X_test)
 
 def tune_lightgbm_optuna(X_train, y_train, n_trials=30):
@@ -120,33 +132,35 @@ def tune_xgboost_optuna(X_train, y_train, n_trials=30):
     print(f"  Optuna best MAE (CV): {study.best_value:.1f} MW  |  Trials: {n_trials}")
     return best_params
 
-def build_stacking_ensemble(predictions: dict, y_train_preds: dict, y_train_actual):
+def build_stacking_ensemble(X_train, y_train, X_test, best_lgb_params, best_xgb_params):
     """
     Build a stacking ensemble using Ridge regression as meta-learner.
-    Instead of manual weights, learns optimal combination from training predictions.
-    
-    Args:
-        predictions: dict of {model_name: test_predictions}
-        y_train_preds: dict of {model_name: train_predictions (OOF)}
-        y_train_actual: actual training targets
-    Returns:
-        ensemble_pred, meta_model, weights_dict
+    Uses proper TimeSeriesSplit to generate unbiased out-of-fold predictions
+    for the meta-learner, completely avoiding in-sample overfitting.
     """
-    # Build meta-features from training predictions
-    train_meta = np.column_stack(list(y_train_preds.values()))
-    test_meta = np.column_stack(list(predictions.values()))
+    from sklearn.ensemble import StackingRegressor
     
-    meta_model = Ridge(alpha=1.0)
-    meta_model.fit(train_meta, y_train_actual)
+    estimators = [
+        ('lgb', lgb.LGBMRegressor(**best_lgb_params)),
+        ('xgb', xgb.XGBRegressor(**best_xgb_params))
+    ]
     
-    ensemble_pred = meta_model.predict(test_meta)
+    tscv = TimeSeriesSplit(n_splits=3)
     
-    # Extract learned weights (normalized)
-    raw_weights = meta_model.coef_
-    weights = raw_weights / raw_weights.sum()
-    weights_dict = dict(zip(predictions.keys(), weights))
+    stacking_model = StackingRegressor(
+        estimators=estimators,
+        final_estimator=Ridge(alpha=1.0),
+        cv=tscv,
+        n_jobs=-1
+    )
     
-    return ensemble_pred, meta_model, weights_dict
+    stacking_model.fit(X_train, y_train)
+    
+    print("\n  Stacking Meta-Learner Weights:")
+    for name, weight in zip([e[0] for e in estimators], stacking_model.final_estimator_.coef_):
+        print(f"    {name}: {weight:.3f}")
+        
+    return stacking_model, stacking_model.predict(X_test)
 
 def train_lstm(df_clean, target_col, feature_cols, train_end_date, lookback=168):
     """Train an LSTM model using Keras/JAX."""
@@ -156,9 +170,17 @@ def train_lstm(df_clean, target_col, feature_cols, train_end_date, lookback=168)
         from keras import layers, models, callbacks
         from sklearn.preprocessing import StandardScaler
         
+        # Fix Leakage: Ensure scalers are strictly fitted on the Training subset
+        train_df = df_clean.loc[:train_end_date]
+        
         scaler_X, scaler_y = StandardScaler(), StandardScaler()
-        X_all = scaler_X.fit_transform(df_clean[feature_cols].values)
-        y_all = scaler_y.fit_transform(df_clean[target_col].values.reshape(-1, 1)).flatten()
+        # Fit ONLY on the isolated training subset
+        scaler_X.fit(train_df[feature_cols].values)
+        scaler_y.fit(train_df[target_col].values.reshape(-1, 1))
+        
+        # Transform the full dataset based on training stats
+        X_all = scaler_X.transform(df_clean[feature_cols].values)
+        y_all = scaler_y.transform(df_clean[target_col].values.reshape(-1, 1)).flatten()
         
         # Create sequences
         Xs, ys = [], []

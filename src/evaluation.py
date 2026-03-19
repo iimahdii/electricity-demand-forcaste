@@ -48,57 +48,43 @@ def plot_residuals(y_true, y_pred, filename="10_residuals.png"):
     plt.close()
 
 def plot_24h_forecast(y_true, y_pred, model_name="Best Model", filename="11_24h_forecast_demo.png"):
-    """Plot an interactive 24-hour forecast for the best sample day in July or August."""
+    """Plot an interactive 24-hour forecast for a fixed sample day in July or August."""
     import matplotlib.dates as mdates
     
     # Create DataFrame with true and predicted
     df_eval = pd.DataFrame({'Actual': y_true, 'Predicted': y_pred})
     
-    # Filter for July and August
-    df_summer = df_eval[(df_eval.index.month == 7) | (df_eval.index.month == 8)].copy()
-    
-    if df_summer.empty:
-        print("No July or August data found in the test set for 24h plot.")
-        return
+    # Select a specific representative day in August (e.g., Aug 10, 2020) 
+    # This is explicitly fixed to avoid cherry-picking the absolute best performance
+    sample_day = '2020-08-10'
+    try:
+        df_demo = df_eval.loc[sample_day].copy()
+        if df_demo.empty:
+            raise KeyError
+    except KeyError:
+        df_demo = df_eval.iloc[:24].copy()
+        sample_day = df_demo.index[0].strftime('%Y-%m-%d')
         
-    # Find the day with the lowest Mean Absolute Error
-    df_summer['Date'] = df_summer.index.date
-    daily_errors = {}
-    
-    for date, group in df_summer.groupby('Date'):
-        if len(group) == 24: # Only consider full 24-hour days
-            mae = np.mean(np.abs(group['Actual'] - group['Predicted']))
-            daily_errors[date] = mae
-            
-    if not daily_errors:
-         print("No full 24-hour days found in July/August.")
-         return
-         
-    best_date = min(daily_errors, key=daily_errors.get)
-    best_day_data = df_summer[df_summer['Date'] == best_date].copy()
-    
-    # Print tabular results
-    print(f"\n--- Best 24-Hour Forecast Found: {best_date} (Model: {model_name}) ---")
-    best_day_data['Error (%)'] = np.abs(best_day_data['Actual'] - best_day_data['Predicted']) / best_day_data['Actual'] * 100
-    print(best_day_data[['Actual', 'Predicted', 'Error (%)']].round(2))
+    print(f"\n--- 24-Hour Demo Forecast ({sample_day}) (Model: {model_name}) ---")
+    df_demo['Error (%)'] = np.abs(df_demo['Actual'] - df_demo['Predicted']) / df_demo['Actual'] * 100
+    print(df_demo[['Actual', 'Predicted', 'Error (%)']].round(2))
     print("-" * 60)
     
-    # Plotting
     fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(best_day_data.index, best_day_data['Actual'], label='Actual Demand', color='black', linewidth=2, marker='o')
+    ax.plot(df_demo.index, df_demo['Actual'], label='Actual Demand', color='black', linewidth=2, marker='o')
     
     # Get just the date string for the title
-    date_str = pd.Timestamp(best_date).strftime("%B %d, %Y")
+    date_str = pd.Timestamp(sample_day).strftime("%B %d, %Y")
     
-    ax.plot(best_day_data.index, best_day_data['Predicted'], label=f'Predicted ({model_name})', color='darkorange', linewidth=2, marker='s', linestyle='--')
+    ax.plot(df_demo.index, df_demo['Predicted'], label=f'Predicted ({model_name})', color='darkorange', linewidth=2, marker='s', linestyle='--')
     
-    ax.fill_between(best_day_data.index, best_day_data['Actual'], best_day_data['Predicted'], color='orange', alpha=0.15)
+    ax.fill_between(df_demo.index, df_demo['Actual'], df_demo['Predicted'], color='orange', alpha=0.15)
     
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
     ax.xaxis.set_major_locator(mdates.HourLocator(interval=2))
     plt.xticks(rotation=45)
     
-    plt.title(f"24-Hour Electricity Demand Forecast Demo - {date_str}\nModel: {model_name} (Lowest Error Day in Summer)", fontsize=14, fontweight='bold', pad=15)
+    plt.title(f"24-Hour Electricity Demand Forecast Demo - {date_str}\nModel: {model_name} (Fixed Unbiased Day, No Cherry-Picking)", fontsize=14, fontweight='bold', pad=15)
     plt.ylabel("Demand (MW)", fontsize=12)
     plt.xlabel("Hour of Day", fontsize=12)
     plt.grid(True, alpha=0.3, linestyle='--')
